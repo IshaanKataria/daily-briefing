@@ -35,7 +35,7 @@ jobs:
       - name: Write token files from secrets
         run: |
           echo '${{ secrets.TOKEN_PERSONAL }}' > token_personal.json
-          echo '${{ secrets.TOKEN_SCHOOL }}' > token_school.json
+          echo '${{ secrets.TOKEN_UNI }}' > token_uni.json
           echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
       - name: Determine mode from schedule
