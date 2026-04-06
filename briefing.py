@@ -32,14 +32,18 @@ def load_credentials(account_name, base_dir):
         print(f"Warning: No token for {account_name}, skipping")
         return None
 
-    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    try:
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(token_path, "w") as f:
+                f.write(creds.to_json())
 
-    return creds
+        return creds
+    except Exception as e:
+        print(f"Error loading credentials for {account_name}: {e}")
+        return None
 
 
 def fetch_emails(creds, account_name, max_results=10):
@@ -184,41 +188,42 @@ def send_sms(message):
     print(f"SMS sent to {to_number}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Daily Briefing SMS")
-    parser.add_argument("--mode", required=True, choices=["morning", "evening"],
-                        help="morning = today's briefing, evening = recap + tomorrow preview")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print briefing without sending SMS")
-    args = parser.parse_args()
+def send_error_sms(error_msg, mode):
+    """Send a one-line error SMS so failures aren't silent."""
+    try:
+        truncated = error_msg[:200]
+        send_sms(f"[Daily Briefing {mode.upper()} FAILED] {truncated}")
+    except Exception as e:
+        print(f"Could not send error SMS: {e}")
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
 
+def run_briefing(args, base_dir):
     all_emails = []
     all_events = []
 
-    # Fetch from all accounts
+    # Fetch from all accounts -- per-account try/except so one failure doesn't kill the run
     for account in ACCOUNTS:
-        creds = load_credentials(account, base_dir)
-        if not creds:
+        try:
+            creds = load_credentials(account, base_dir)
+            if not creds:
+                continue
+
+            all_emails.extend(fetch_emails(creds, account))
+
+            if args.mode == "morning":
+                is_monday = datetime.now().weekday() == 0
+                days = 7 if is_monday else 1
+                all_events.extend(fetch_calendar_events(creds, account, days_ahead=days))
+            else:
+                all_events.extend(fetch_calendar_events(creds, account, days_ahead=2))
+        except Exception as e:
+            print(f"Error processing {account} account: {e}")
             continue
-
-        all_emails.extend(fetch_emails(creds, account))
-
-        # Morning: today's events (+ week if Monday)
-        # Evening: tomorrow's events
-        if args.mode == "morning":
-            is_monday = datetime.now().weekday() == 0
-            days = 7 if is_monday else 1
-            all_events.extend(fetch_calendar_events(creds, account, days_ahead=days))
-        else:
-            all_events.extend(fetch_calendar_events(creds, account, days_ahead=2))
 
     if not all_emails and not all_events:
         print("No emails or events found. Skipping briefing.")
         return
 
-    # Summarize with Claude
     is_monday = datetime.now().weekday() == 0
     briefing = summarize_with_claude(all_emails, all_events, args.mode, is_monday)
 
@@ -230,6 +235,25 @@ def main():
         send_sms(briefing)
     else:
         print("\n(Dry run — SMS not sent)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Daily Briefing SMS")
+    parser.add_argument("--mode", required=True, choices=["morning", "evening"],
+                        help="morning = today's briefing, evening = recap + tomorrow preview")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print briefing without sending SMS")
+    args = parser.parse_args()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        run_briefing(args, base_dir)
+    except Exception as e:
+        print(f"FATAL: briefing crashed: {e}")
+        if not args.dry_run:
+            send_error_sms(str(e), args.mode)
+        raise
 
 
 if __name__ == "__main__":

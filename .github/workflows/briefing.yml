@@ -1,11 +1,8 @@
 name: Daily Briefing SMS
 
 on:
-  schedule:
-    # 8am AEST = 10pm UTC (previous day)
-    - cron: '0 22 * * *'
-    # 9pm AEST = 11am UTC
-    - cron: '0 11 * * *'
+  # Schedule disabled -- migrated to Hostbrr VPS cron (2026-04-06)
+  # VPS handles morning (8am) and evening (9pm) briefings via /root/daily-briefing/run-briefing.sh
   workflow_dispatch:
     inputs:
       mode:
