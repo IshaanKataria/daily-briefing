@@ -1,12 +1,23 @@
-name: Daily Briefing SMS
+name: Daily Briefing
 
+# The Hostbrr VPS was retired, so scheduling moved back to GitHub Actions on 2026-08-22.
+# The original reason for leaving Actions (OAuth refresh tokens expiring on ephemeral
+# runners) turned out to be wrong: the personal refresh token has stayed valid for
+# months, so nothing needs to persist between runs.
+#
+# Actions cron is UTC-only and Melbourne shifts between UTC+10 and UTC+11, so this
+# fires on all four candidate hours and briefing.py decides from Melbourne local time
+# whether to actually run. Two of the four exit immediately as no-ops.
 on:
-  # Schedule disabled -- migrated to Hostbrr VPS cron (2026-04-06)
-  # VPS handles morning (8am) and evening (9pm) briefings via /root/daily-briefing/run-briefing.sh
+  schedule:
+    - cron: '0 21 * * *'   # 08:00 AEDT
+    - cron: '0 22 * * *'   # 08:00 AEST
+    - cron: '0 10 * * *'   # 21:00 AEDT
+    - cron: '0 11 * * *'   # 21:00 AEST
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Briefing mode'
+        description: 'Briefing mode (manual runs bypass the local-time check)'
         required: true
         default: 'morning'
         type: choice
@@ -27,7 +38,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib anthropic twilio
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib anthropic
 
       - name: Write token files from secrets
         run: |
@@ -35,25 +46,13 @@ jobs:
           echo '${{ secrets.TOKEN_UNI }}' > token_uni.json
           echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
-      - name: Determine mode from schedule
-        id: mode
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT
-          else
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" = "22" ]; then
-              echo "mode=morning" >> $GITHUB_OUTPUT
-            else
-              echo "mode=evening" >> $GITHUB_OUTPUT
-            fi
-          fi
-
       - name: Run briefing
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
-          TWILIO_TO_NUMBER: ${{ secrets.TWILIO_TO_NUMBER }}
-        run: python briefing.py --mode ${{ steps.mode.outputs.mode }}
+          BRIEFING_TO_EMAIL: ${{ secrets.BRIEFING_TO_EMAIL }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python briefing.py --mode ${{ inputs.mode }}
+          else
+            python briefing.py
+          fi

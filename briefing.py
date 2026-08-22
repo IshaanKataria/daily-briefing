@@ -7,16 +7,22 @@ rejected with Twilio error 30044 (trial accounts cap message length and the
 briefs run ~1500 chars), so only the very first test message ever arrived.
 Email has no length cap and no per-message cost.
 
+Scheduling is timezone-safe: GitHub Actions fires this on every candidate UTC
+hour and the script itself decides, from Melbourne wall-clock time, whether the
+current hour is a briefing hour. Nothing needs editing when DST flips.
+
 Usage:
+    uv run python3 briefing.py                  # auto-detect mode, skip if off-hour
     uv run python3 briefing.py --mode morning
-    uv run python3 briefing.py --mode evening
+    uv run python3 briefing.py --mode evening --dry-run
 """
 import argparse
 import os
 import json
 import base64
 from email.message import EmailMessage
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -30,6 +36,32 @@ SCOPES = [
 ]
 
 ACCOUNTS = ["personal", "uni"]
+
+# GitHub Actions cron only understands UTC, which drifts by an hour when Melbourne
+# switches between AEST and AEDT. Rather than editing the cron twice a year, the
+# workflow fires on every candidate UTC hour and this module decides whether the
+# local Melbourne time is actually a briefing hour.
+MELBOURNE = ZoneInfo("Australia/Melbourne")
+BRIEFING_HOURS = {8: "morning", 21: "evening"}
+
+
+def local_now():
+    return datetime.now(MELBOURNE)
+
+
+def resolve_mode(explicit_mode):
+    """Pick the briefing mode from Melbourne wall-clock time, or honour an explicit one."""
+    if explicit_mode:
+        return explicit_mode
+
+    now = local_now()
+    mode = BRIEFING_HOURS.get(now.hour)
+    if mode is None:
+        print(
+            f"Local Melbourne time is {now:%H:%M %Z} which is not a briefing hour "
+            f"({', '.join(f'{h:02d}:00' for h in sorted(BRIEFING_HOURS))}). Skipping."
+        )
+    return mode
 
 
 def load_credentials(account_name, base_dir):
@@ -89,9 +121,16 @@ def fetch_calendar_events(creds, account_name, days_ahead=1):
     try:
         service = build("calendar", "v3", credentials=creds)
 
-        now = datetime.now(timezone.utc)
+        # Bound the window by Melbourne calendar days, not a rolling 24 hours from now,
+        # so an 8am brief covers today rather than bleeding into tomorrow morning.
+        now = local_now()
+        end_day = (now + timedelta(days=days_ahead - 1)).date()
+        window_end = datetime.combine(
+            end_day, datetime.max.time(), tzinfo=MELBOURNE
+        )
+
         time_min = now.isoformat()
-        time_max = (now + timedelta(days=days_ahead)).isoformat()
+        time_max = window_end.isoformat()
 
         events_result = service.events().list(
             calendarId="primary",
@@ -206,6 +245,12 @@ def run_briefing(args, base_dir, sender_creds=None):
     all_emails = []
     all_events = []
 
+    is_monday = local_now().weekday() == 0
+    if args.mode == "morning":
+        days_ahead = 7 if is_monday else 1
+    else:
+        days_ahead = 2
+
     # Fetch from all accounts -- per-account try/except so one failure doesn't kill the run
     for account in ACCOUNTS:
         try:
@@ -218,12 +263,9 @@ def run_briefing(args, base_dir, sender_creds=None):
 
             all_emails.extend(fetch_emails(creds, account))
 
-            if args.mode == "morning":
-                is_monday = datetime.now().weekday() == 0
-                days = 7 if is_monday else 1
-                all_events.extend(fetch_calendar_events(creds, account, days_ahead=days))
-            else:
-                all_events.extend(fetch_calendar_events(creds, account, days_ahead=2))
+            all_events.extend(
+                fetch_calendar_events(creds, account, days_ahead=days_ahead)
+            )
         except Exception as e:
             print(f"Error processing {account} account: {e}")
             continue
@@ -232,7 +274,6 @@ def run_briefing(args, base_dir, sender_creds=None):
         print("No emails or events found. Skipping briefing.")
         return sender_creds
 
-    is_monday = datetime.now().weekday() == 0
     briefing = summarize_with_claude(all_emails, all_events, args.mode, is_monday)
 
     print("=" * 50)
@@ -241,7 +282,7 @@ def run_briefing(args, base_dir, sender_creds=None):
 
     if not args.dry_run:
         label = "Morning" if args.mode == "morning" else "Evening"
-        subject = f"{label} briefing - {datetime.now().strftime('%a %d %b')}"
+        subject = f"{label} briefing - {local_now():%a %d %b}"
         send_email(sender_creds, subject, briefing)
     else:
         print("\n(Dry run — email not sent)")
@@ -250,12 +291,20 @@ def run_briefing(args, base_dir, sender_creds=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily Briefing email")
-    parser.add_argument("--mode", required=True, choices=["morning", "evening"],
-                        help="morning = today's briefing, evening = recap + tomorrow preview")
+    parser = argparse.ArgumentParser(
+        description="Daily Briefing email. With no --mode, the mode is derived from "
+                    "the current Melbourne time and the run is skipped outside "
+                    "briefing hours, which keeps UTC cron schedules correct across DST."
+    )
+    parser.add_argument("--mode", choices=["morning", "evening"],
+                        help="Force a mode. Omit on scheduled runs to auto-detect.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print briefing without sending the email")
     args = parser.parse_args()
+
+    args.mode = resolve_mode(args.mode)
+    if args.mode is None:
+        return
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     sender_creds = None
