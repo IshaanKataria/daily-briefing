@@ -3,7 +3,7 @@ One-time auth setup script.
 Run this locally to generate OAuth tokens for each Google account.
 Usage:
     uv run python3 auth_setup.py --account personal
-    uv run python3 auth_setup.py --account school
+    uv run python3 auth_setup.py --account uni
 """
 import argparse
 import os
@@ -11,13 +11,14 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
 
 def main():
     parser = argparse.ArgumentParser(description="Authenticate a Google account for Daily Briefing")
     parser.add_argument("--account", required=True, choices=["personal", "uni"],
-                        help="Which account to authenticate: personal or school")
+                        help="Which account to authenticate: personal or uni")
     args = parser.parse_args()
 
     creds_file = os.path.join(os.path.dirname(__file__), "credentials.json")

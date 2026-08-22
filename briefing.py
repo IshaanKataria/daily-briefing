@@ -1,6 +1,11 @@
 """
 Daily Briefing: Fetches Gmail + Calendar from multiple accounts,
-summarizes with Claude, sends SMS via Twilio.
+summarizes with Claude, emails the brief to you.
+
+Delivery moved from Twilio SMS to email on 2026-08-22. Every SMS was being
+rejected with Twilio error 30044 (trial accounts cap message length and the
+briefs run ~1500 chars), so only the very first test message ever arrived.
+Email has no length cap and no per-message cost.
 
 Usage:
     uv run python3 briefing.py --mode morning
@@ -10,16 +15,17 @@ import argparse
 import os
 import json
 import base64
+from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import anthropic
-from twilio.rest import Client as TwilioClient
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
 
@@ -129,9 +135,7 @@ def summarize_with_claude(emails, events, mode, is_monday=False):
     if is_monday and mode == "morning":
         week_section = "\nAlso include a WEEK AHEAD section since it's Monday — summarize the full week's events."
 
-    prompt = f"""You are a personal briefing assistant. Create a concise SMS briefing (under 300 words, must fit in a text message).
-
-MODE: {mode.upper()} BRIEFING
+    prompt = f"""You are Ishaan's personal briefing assistant. Write his {mode} briefing as a plain text email.
 
 EMAILS ({len(emails)} unread):
 {json.dumps(emails, indent=2)}
@@ -140,64 +144,65 @@ CALENDAR EVENTS for {days_label}:
 {json.dumps(events, indent=2)}
 {week_section}
 
-Format the briefing as:
-- Start with a one-line greeting based on time of day
-- CALENDAR: list events with times (convert to AEST)
-- EMAIL: highlight the most important ones, group by account (personal/uni)
-- ACTION ITEMS: flag anything that needs a reply or action
-- Keep it punchy and scannable — this is a text message, not an essay
-- Use plain text only, no markdown"""
+Use these sections in this order:
+
+CALENDAR
+Events in time order, times converted to AEST. One line each. Say plainly if the day is clear.
+
+INBOX
+The messages that actually matter. Skip newsletters, job alerts and automated noise entirely rather than listing them. Group by account (personal/uni).
+
+ACTION ITEMS
+Anything with a deadline or that needs a decision today. If there is nothing, say so.
+
+Rules:
+- Plain text only, no markdown, no asterisks, no headers with hash symbols.
+- Be direct and specific. Name people, subjects and day counts.
+- No greeting, no sign-off, no filler.
+- Aim for under 400 words."""
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=500,
+        max_tokens=1200,
         messages=[{"role": "user", "content": prompt}],
     )
 
     return response.content[0].text
 
 
-def send_sms(message):
-    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-    from_number = os.environ.get("TWILIO_FROM_NUMBER")
-    to_number = os.environ.get("TWILIO_TO_NUMBER")
+def send_email(creds, subject, body):
+    to_address = os.environ.get("BRIEFING_TO_EMAIL")
+    if not to_address:
+        raise ValueError("BRIEFING_TO_EMAIL not set")
+    if not creds:
+        raise ValueError("No Google credentials available to send with")
 
-    if not all([account_sid, auth_token, from_number, to_number]):
-        raise ValueError("Twilio env vars not fully set")
+    service = build("gmail", "v1", credentials=creds)
 
-    client = TwilioClient(account_sid, auth_token)
+    message = EmailMessage()
+    message.set_content(body)
+    message["To"] = to_address
+    message["Subject"] = subject
 
-    # Split into multiple messages if over SMS limit (1600 chars)
-    if len(message) > 1600:
-        parts = [message[i:i+1550] for i in range(0, len(message), 1550)]
-        for i, part in enumerate(parts):
-            prefix = f"[{i+1}/{len(parts)}] " if len(parts) > 1 else ""
-            client.messages.create(
-                body=prefix + part,
-                from_=from_number,
-                to=to_number,
-            )
-    else:
-        client.messages.create(
-            body=message,
-            from_=from_number,
-            to=to_number,
-        )
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    service.users().messages().send(userId="me", body={"raw": encoded}).execute()
 
-    print(f"SMS sent to {to_number}")
+    print(f"Email sent to {to_address}")
 
 
-def send_error_sms(error_msg, mode):
-    """Send a one-line error SMS so failures aren't silent."""
+def send_error_email(creds, error_msg, mode):
+    """Send a short failure notice so a broken run isn't silent."""
     try:
-        truncated = error_msg[:200]
-        send_sms(f"[Daily Briefing {mode.upper()} FAILED] {truncated}")
+        send_email(
+            creds,
+            f"Daily Briefing {mode.upper()} FAILED",
+            f"The {mode} briefing crashed:\n\n{error_msg[:1000]}",
+        )
     except Exception as e:
-        print(f"Could not send error SMS: {e}")
+        print(f"Could not send error email: {e}")
 
 
-def run_briefing(args, base_dir):
+def run_briefing(args, base_dir, sender_creds=None):
     all_emails = []
     all_events = []
 
@@ -207,6 +212,9 @@ def run_briefing(args, base_dir):
             creds = load_credentials(account, base_dir)
             if not creds:
                 continue
+
+            if sender_creds is None:
+                sender_creds = creds
 
             all_emails.extend(fetch_emails(creds, account))
 
@@ -222,7 +230,7 @@ def run_briefing(args, base_dir):
 
     if not all_emails and not all_events:
         print("No emails or events found. Skipping briefing.")
-        return
+        return sender_creds
 
     is_monday = datetime.now().weekday() == 0
     briefing = summarize_with_claude(all_emails, all_events, args.mode, is_monday)
@@ -232,27 +240,34 @@ def run_briefing(args, base_dir):
     print("=" * 50)
 
     if not args.dry_run:
-        send_sms(briefing)
+        label = "Morning" if args.mode == "morning" else "Evening"
+        subject = f"{label} briefing - {datetime.now().strftime('%a %d %b')}"
+        send_email(sender_creds, subject, briefing)
     else:
-        print("\n(Dry run — SMS not sent)")
+        print("\n(Dry run — email not sent)")
+
+    return sender_creds
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily Briefing SMS")
+    parser = argparse.ArgumentParser(description="Daily Briefing email")
     parser.add_argument("--mode", required=True, choices=["morning", "evening"],
                         help="morning = today's briefing, evening = recap + tomorrow preview")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Print briefing without sending SMS")
+                        help="Print briefing without sending the email")
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    sender_creds = None
 
     try:
-        run_briefing(args, base_dir)
+        sender_creds = run_briefing(args, base_dir)
     except Exception as e:
         print(f"FATAL: briefing crashed: {e}")
         if not args.dry_run:
-            send_error_sms(str(e), args.mode)
+            if sender_creds is None:
+                sender_creds = load_credentials("personal", base_dir)
+            send_error_email(sender_creds, str(e), args.mode)
         raise
 
 
