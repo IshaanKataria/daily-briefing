@@ -117,6 +117,47 @@ def fetch_emails(creds, account_name, max_results=10):
         return []
 
 
+def fetch_awaiting_reply(creds, account_name, max_results=15):
+    """Sent threads whose newest message is still ours, i.e. nobody has replied yet."""
+    try:
+        service = build("gmail", "v1", credentials=creds)
+        profile = service.users().getProfile(userId="me").execute()
+        me = profile.get("emailAddress", "").lower()
+
+        results = service.users().threads().list(
+            userId="me", q="in:sent newer_than:30d", maxResults=max_results
+        ).execute()
+
+        pending = []
+        for thread in results.get("threads", []):
+            detail = service.users().threads().get(
+                userId="me", id=thread["id"], format="metadata",
+                metadataHeaders=["Subject", "From", "To", "Date"]
+            ).execute()
+
+            messages = detail.get("messages", [])
+            if not messages:
+                continue
+
+            last = messages[-1]
+            headers = {h["name"]: h["value"] for h in last["payload"]["headers"]}
+            sender = headers.get("From", "").lower()
+
+            # If we sent the newest message, the ball is in their court.
+            if me and me in sender:
+                pending.append({
+                    "account": account_name,
+                    "to": headers.get("To", "Unknown"),
+                    "subject": headers.get("Subject", "No subject"),
+                    "sent": headers.get("Date", ""),
+                })
+
+        return pending
+    except Exception as e:
+        print(f"Error fetching awaiting-reply threads for {account_name}: {e}")
+        return []
+
+
 def fetch_calendar_events(creds, account_name, days_ahead=1):
     try:
         service = build("calendar", "v3", credentials=creds)
@@ -162,7 +203,7 @@ def fetch_calendar_events(creds, account_name, days_ahead=1):
         return []
 
 
-def summarize_with_claude(emails, events, mode, is_monday=False):
+def summarize_with_claude(emails, events, awaiting_reply, mode, is_monday=False):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
@@ -181,6 +222,9 @@ EMAILS ({len(emails)} unread):
 
 CALENDAR EVENTS for {days_label}:
 {json.dumps(events, indent=2)}
+
+SENT THREADS WITH NO REPLY YET ({len(awaiting_reply)}):
+{json.dumps(awaiting_reply, indent=2)}
 {week_section}
 
 Use these sections in this order:
@@ -190,6 +234,9 @@ Events in time order, times converted to AEST. One line each. Say plainly if the
 
 INBOX
 The messages that actually matter. Skip newsletters, job alerts and automated noise entirely rather than listing them. Group by account (personal/uni).
+
+PENDING EMAIL REPLIES
+Two groups. "Waiting on you" for unread threads from a real person that need a response from Ishaan. "Waiting on them" drawn from the sent-threads data above, with how many days it has been sitting and whether it is worth a nudge. If a group is empty, say so in one line.
 
 ACTION ITEMS
 Anything with a deadline or that needs a decision today. If there is nothing, say so.
@@ -244,6 +291,7 @@ def send_error_email(creds, error_msg, mode):
 def run_briefing(args, base_dir, sender_creds=None):
     all_emails = []
     all_events = []
+    all_awaiting = []
 
     is_monday = local_now().weekday() == 0
     if args.mode == "morning":
@@ -262,7 +310,7 @@ def run_briefing(args, base_dir, sender_creds=None):
                 sender_creds = creds
 
             all_emails.extend(fetch_emails(creds, account))
-
+            all_awaiting.extend(fetch_awaiting_reply(creds, account))
             all_events.extend(
                 fetch_calendar_events(creds, account, days_ahead=days_ahead)
             )
@@ -274,7 +322,9 @@ def run_briefing(args, base_dir, sender_creds=None):
         print("No emails or events found. Skipping briefing.")
         return sender_creds
 
-    briefing = summarize_with_claude(all_emails, all_events, args.mode, is_monday)
+    briefing = summarize_with_claude(
+        all_emails, all_events, all_awaiting, args.mode, is_monday
+    )
 
     print("=" * 50)
     print(briefing)
