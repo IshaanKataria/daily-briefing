@@ -117,18 +117,27 @@ def fetch_emails(creds, account_name, max_results=10):
         return []
 
 
-def fetch_awaiting_reply(creds, account_name, max_results=15):
-    """Sent threads whose newest message is still ours, i.e. nobody has replied yet."""
+def fetch_reply_buckets(creds, account_name, max_results=40):
+    """Split our recent correspondence into who owes whom a reply.
+
+    Both buckets come from one sweep of sent threads rather than the inbox. The
+    inbox is mostly newsletters and job alerts, so scanning it needs hundreds of
+    reads to find real conversation; every thread we have actually replied in is
+    reachable from `in:sent` in a few dozen. Whoever sent the newest message in
+    a thread determines which bucket it lands in.
+    """
+    awaiting_them, needs_you = [], []
+    # The brief emails itself, so without this it reports its own output back.
+    self_sent = ("morning briefing", "evening briefing", "daily briefing")
     try:
         service = build("gmail", "v1", credentials=creds)
         profile = service.users().getProfile(userId="me").execute()
         me = profile.get("emailAddress", "").lower()
 
         results = service.users().threads().list(
-            userId="me", q="in:sent newer_than:30d", maxResults=max_results
+            userId="me", q="in:sent newer_than:90d", maxResults=max_results
         ).execute()
 
-        pending = []
         for thread in results.get("threads", []):
             detail = service.users().threads().get(
                 userId="me", id=thread["id"], format="metadata",
@@ -141,21 +150,28 @@ def fetch_awaiting_reply(creds, account_name, max_results=15):
 
             last = messages[-1]
             headers = {h["name"]: h["value"] for h in last["payload"]["headers"]}
+            subject = headers.get("Subject", "No subject")
+            if subject.lower().startswith(self_sent):
+                continue
+
             sender = headers.get("From", "").lower()
+            entry = {
+                "account": account_name,
+                "subject": subject,
+                "last_message": headers.get("Date", ""),
+            }
 
-            # If we sent the newest message, the ball is in their court.
             if me and me in sender:
-                pending.append({
-                    "account": account_name,
-                    "to": headers.get("To", "Unknown"),
-                    "subject": headers.get("Subject", "No subject"),
-                    "sent": headers.get("Date", ""),
-                })
+                entry["to"] = headers.get("To", "Unknown")
+                awaiting_them.append(entry)
+            else:
+                entry["from"] = headers.get("From", "Unknown")
+                needs_you.append(entry)
 
-        return pending
+        return awaiting_them, needs_you
     except Exception as e:
-        print(f"Error fetching awaiting-reply threads for {account_name}: {e}")
-        return []
+        print(f"Error fetching reply buckets for {account_name}: {e}")
+        return [], []
 
 
 def fetch_calendar_events(creds, account_name, days_ahead=1):
@@ -203,7 +219,7 @@ def fetch_calendar_events(creds, account_name, days_ahead=1):
         return []
 
 
-def summarize_with_claude(emails, events, awaiting_reply, mode, is_monday=False):
+def summarize_with_claude(emails, events, awaiting_reply, needs_reply, mode, is_monday=False):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
@@ -223,8 +239,11 @@ EMAILS ({len(emails)} unread):
 CALENDAR EVENTS for {days_label}:
 {json.dumps(events, indent=2)}
 
-SENT THREADS WITH NO REPLY YET ({len(awaiting_reply)}):
+SENT THREADS WITH NO REPLY YET, i.e. waiting on them ({len(awaiting_reply)}):
 {json.dumps(awaiting_reply, indent=2)}
+
+THREADS WHERE THEY SPOKE LAST AND WE OWE A REPLY, i.e. waiting on you ({len(needs_reply)}):
+{json.dumps(needs_reply, indent=2)}
 {week_section}
 
 Use these sections in this order:
@@ -236,7 +255,13 @@ INBOX
 The messages that actually matter. Skip newsletters, job alerts and automated noise entirely rather than listing them. Group by account (personal/uni).
 
 PENDING EMAIL REPLIES
-Two groups. "Waiting on you" for unread threads from a real person that need a response from Ishaan. "Waiting on them" drawn from the sent-threads data above, with how many days it has been sitting and whether it is worth a nudge. If a group is empty, say so in one line.
+Two groups, each ordered by how long it has been sitting.
+"Waiting on you" from the owe-a-reply data above: sender, subject, days since their last message, and a one-line read on what they actually want.
+"Waiting on them" from the sent-threads data above: recipient, subject, days since sent, and whether it is worth a nudge.
+If a group is empty, say so in one line.
+
+ENGINEERING
+Ishaan's role is engineering. Surface anything in the email data that signals a broken build, a failed GitHub Actions run, a deploy error, or an automation that has gone quiet. If nothing is broken, say so in one line rather than padding.
 
 ACTION ITEMS
 Anything with a deadline or that needs a decision today. If there is nothing, say so.
@@ -292,6 +317,7 @@ def run_briefing(args, base_dir, sender_creds=None):
     all_emails = []
     all_events = []
     all_awaiting = []
+    all_needs_reply = []
 
     is_monday = local_now().weekday() == 0
     if args.mode == "morning":
@@ -310,7 +336,9 @@ def run_briefing(args, base_dir, sender_creds=None):
                 sender_creds = creds
 
             all_emails.extend(fetch_emails(creds, account))
-            all_awaiting.extend(fetch_awaiting_reply(creds, account))
+            owed_by_them, owed_by_us = fetch_reply_buckets(creds, account)
+            all_awaiting.extend(owed_by_them)
+            all_needs_reply.extend(owed_by_us)
             all_events.extend(
                 fetch_calendar_events(creds, account, days_ahead=days_ahead)
             )
@@ -323,7 +351,7 @@ def run_briefing(args, base_dir, sender_creds=None):
         return sender_creds
 
     briefing = summarize_with_claude(
-        all_emails, all_events, all_awaiting, args.mode, is_monday
+        all_emails, all_events, all_awaiting, all_needs_reply, args.mode, is_monday
     )
 
     print("=" * 50)
