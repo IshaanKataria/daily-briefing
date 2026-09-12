@@ -42,11 +42,25 @@ ACCOUNTS = ["personal", "uni"]
 # workflow fires on every candidate UTC hour and this module decides whether the
 # local Melbourne time is actually a briefing hour.
 MELBOURNE = ZoneInfo("Australia/Melbourne")
-BRIEFING_HOURS = {8: "morning", 21: "evening"}
+
+# Actions routinely fires scheduled jobs hours late, so these are tolerance windows
+# rather than exact hours. An earlier version demanded the local hour be exactly 8
+# or 21 and silently skipped every delayed run, which cost two days of briefings.
+# Overlap between the windows is not allowed, and already_sent() stops the wide
+# windows from producing duplicates.
+BRIEFING_WINDOWS = {
+    "morning": range(5, 14),
+    "evening": range(17, 24),
+}
 
 
 def local_now():
     return datetime.now(MELBOURNE)
+
+
+def briefing_subject(mode):
+    label = "Morning" if mode == "morning" else "Evening"
+    return f"{label} briefing - {local_now():%a %d %b}"
 
 
 def resolve_mode(explicit_mode):
@@ -54,14 +68,38 @@ def resolve_mode(explicit_mode):
     if explicit_mode:
         return explicit_mode
 
-    now = local_now()
-    mode = BRIEFING_HOURS.get(now.hour)
-    if mode is None:
-        print(
-            f"Local Melbourne time is {now:%H:%M %Z} which is not a briefing hour "
-            f"({', '.join(f'{h:02d}:00' for h in sorted(BRIEFING_HOURS))}). Skipping."
-        )
-    return mode
+    hour = local_now().hour
+    for mode, window in BRIEFING_WINDOWS.items():
+        if hour in window:
+            return mode
+
+    print(
+        f"Local Melbourne time is {local_now():%H:%M %Z}, outside every briefing "
+        f"window. Skipping."
+    )
+    return None
+
+
+def already_sent(creds, subject):
+    """Has this exact briefing already gone out today?
+
+    The runners are ephemeral, so there is nowhere to record that a briefing was
+    delivered. The sent folder is that record: the subject carries the date and
+    the mode, so it is unique per briefing. This is what makes it safe for all
+    four cron slots to survive being delayed into the same window.
+    """
+    if not creds:
+        return False
+    try:
+        service = build("gmail", "v1", credentials=creds)
+        results = service.users().messages().list(
+            userId="me", q=f'in:sent subject:"{subject}" newer_than:2d', maxResults=1
+        ).execute()
+        return bool(results.get("messages"))
+    except Exception as e:
+        # Never block a briefing because the duplicate check itself broke.
+        print(f"Could not check for an existing briefing: {e}")
+        return False
 
 
 def load_credentials(account_name, base_dir):
@@ -359,9 +397,7 @@ def run_briefing(args, base_dir, sender_creds=None):
     print("=" * 50)
 
     if not args.dry_run:
-        label = "Morning" if args.mode == "morning" else "Evening"
-        subject = f"{label} briefing - {local_now():%a %d %b}"
-        send_email(sender_creds, subject, briefing)
+        send_email(sender_creds, briefing_subject(args.mode), briefing)
     else:
         print("\n(Dry run — email not sent)")
 
@@ -385,15 +421,18 @@ def main():
         return
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    sender_creds = None
+    sender_creds = load_credentials("personal", base_dir)
+
+    subject = briefing_subject(args.mode)
+    if not args.dry_run and already_sent(sender_creds, subject):
+        print(f"{subject!r} has already gone out today. Skipping.")
+        return
 
     try:
-        sender_creds = run_briefing(args, base_dir)
+        sender_creds = run_briefing(args, base_dir, sender_creds)
     except Exception as e:
         print(f"FATAL: briefing crashed: {e}")
         if not args.dry_run:
-            if sender_creds is None:
-                sender_creds = load_credentials("personal", base_dir)
             send_error_email(sender_creds, str(e), args.mode)
         raise
 
